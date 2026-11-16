@@ -1,0 +1,310 @@
+---
+title: "IEEP - Ingresos de los Gobiernos Regionales"
+output: html_document
+date: "2026-10-05"
+---
+
+## Librerías
+```{r instalar, eval=FALSE}
+install.packages(c("tidyverse", "scales", "DT", "gt", "webshot2"))
+```
+
+## Setup
+```{r setup}
+knitr::opts_knit$set(root.dir = "C:/Users/User/OneDrive/0_BE/Documentos/Rstudio")
+rm(list = ls())
+library(tidyverse)
+library(scales)
+library(DT)   # tablas interactivas en el Viewer
+library(gt)   # tablas de calidad de publicación
+options(timeout = 600)   # el CSV es pesado
+```
+
+## Cargando la BD
+```{r datos}
+url_mef <- "https://fs.datosabiertos.mef.gob.pe/datastorefiles/comparativo_ingresos_2012_2025.csv"
+archivo <- basename(url_mef)
+if (!file.exists(archivo)) download.file(url_mef, archivo, mode = "wb")   # descarga solo si no está en local
+
+dt_ingresos <- read_csv(
+  file = archivo,
+  locale = locale(encoding = "UTF-8"),
+  col_types = cols(RUBRO = col_character()),   # el código de rubro debe ser texto
+  show_col_types = FALSE
+)
+```
+
+## Parámetros
+```{r parametros}
+anio_sel    <- 2025                                # año de la tabla (existen 2012-2025)
+medidas     <- c("PIA", "PIM", "RECAUDADO")        # PIA = presupuesto inicial | PIM = presupuesto modificado | RECAUDADO = cobrado
+unidad      <- "DEPARTAMENTO_EJECUTORA_NOMBRE"     # filas: departamento donde está la unidad ejecutora | "PLIEGO_NOMBRE": entidad a la que la ley asigna el presupuesto (solo para validar contra Consulta Amigable)
+medida_graf <- "RECAUDADO"                         # medida que muestran los gráficos
+divisor     <- 1e6                                 # 1e6 = millones de soles | 1 = soles
+digitos     <- 1                                   # decimales de la tabla final
+
+nombres_cortos <- c(                               # títulos de columna por código de rubro
+  "09" = "Rec. Directamente Recaudados",
+  "13" = "Donaciones y Transferencias",
+  "15" = "FONCOR",
+  "18" = "Canon y Sobrecanon",
+  "19" = "Op. Oficiales de Crédito"
+)
+# Si aparece otro rubro, añade aquí su código; si no, saldrá sin nombre corto.
+
+unidad_txt <- if (divisor == 1e6) "millones de soles" else "soles"
+monto_cols <- paste("MONTO", medidas, anio_sel, sep = "_")
+stopifnot(all(monto_cols %in% names(dt_ingresos)))   # falla si algún nombre no existe
+```
+
+## Exploración (correr una vez)
+```{r exploracion, eval=FALSE}
+glimpse(dt_ingresos)
+
+# ¿Hay mancomunidades mezcladas con gobiernos regionales?
+dt_ingresos %>%
+  filter(NIVEL_GOBIERNO == "R") %>%
+  distinct(SECTOR, SECTOR_NOMBRE)
+
+# Totales de un departamento (para contrastar con Consulta Amigable)
+dt_ingresos %>%
+  filter(NIVEL_GOBIERNO_NOMBRE == "GOBIERNOS REGIONALES",
+         DEPARTAMENTO_EJECUTORA_NOMBRE == "HUANCAVELICA") %>%
+  summarise(across(all_of(monto_cols), ~ sum(.x, na.rm = TRUE))) %>%
+  mutate(across(everything(), ~ format(round(.x, 2), big.mark = ",", scientific = FALSE)))
+
+# Búsqueda puntual
+tabla_busqueda <- dt_ingresos %>%
+  filter(NIVEL_GOBIERNO_NOMBRE == "GOBIERNOS REGIONALES",
+         PLIEGO_NOMBRE == "GOBIERNO REGIONAL DEL DEPARTAMENTO DE HUANCAVELICA",
+         FUENTE_FINANC_NOMBRE == "RECURSOS POR OPERACIONES OFICIALES DE CREDITO")
+```
+
+## Tabla resumen: PIA, PIM y recaudado
+```{r tabla}
+dt_reg <- dt_ingresos %>%
+  filter(NIVEL_GOBIERNO_NOMBRE == "GOBIERNOS REGIONALES",
+         SECTOR_NOMBRE == "GOBIERNOS REGIONALES")   # deja fuera mancomunidades regionales
+
+# Serie completa: una fila por unidad x rubro x año
+dt_hist <- dt_reg %>%
+  select(all_of(unidad), RUBRO, RUBRO_NOMBRE, matches("^MONTO_(PIA|PIM|RECAUDADO)_\\d{4}$")) %>%
+  pivot_longer(starts_with("MONTO_"),
+               names_to = c(".value", "anio"),
+               names_pattern = "^MONTO_(.*)_(\\d{4})$",
+               names_transform = list(anio = as.integer)) %>%
+  group_by(across(all_of(c(unidad, "RUBRO", "RUBRO_NOMBRE", "anio")))) %>%
+  summarise(across(all_of(medidas), ~ sum(as.numeric(.x), na.rm = TRUE)), .groups = "drop")
+
+tabla_mef <- dt_hist %>%
+  filter(anio == anio_sel) %>%
+  select(-anio) %>%
+  arrange(.data[[unidad]], RUBRO)   # departamentos A-Z y, dentro de cada uno, rubros por código
+
+print(tabla_mef)
+write.csv(tabla_mef, file = "tabla_mef.csv", row.names = FALSE)
+```
+
+## Control de calidad
+```{r control}
+total_tabla <- colSums(select(tabla_mef, all_of(medidas)))
+total_base  <- colSums(sapply(dt_reg[monto_cols], as.numeric), na.rm = TRUE)
+all.equal(total_tabla, total_base, check.attributes = FALSE)   # debe dar TRUE
+```
+
+## Tabla con totales por departamento
+```{r tabla-total}
+tabla_mef_total <- tabla_mef %>%
+  group_by(across(all_of(unidad))) %>%
+  group_modify(~ bind_rows(
+    .x,
+    summarise(.x, RUBRO_NOMBRE = "TOTAL", across(all_of(medidas), sum))
+  )) %>%
+  ungroup()
+
+datatable(
+  tabla_mef_total,
+  rownames = FALSE,
+  options = list(pageLength = 25, scrollX = TRUE, dom = "ftip")
+) %>%
+  formatRound(columns = medidas, digits = 2, mark = ",")
+```
+
+## Tabla final
+```{r tabla-final}
+rubros <- sort(unique(tabla_mef$RUBRO))
+
+tabla_ancha <- tabla_mef %>%
+  mutate(across(all_of(unidad), ~ tools::toTitleCase(tolower(.x))),   # "LA LIBERTAD" -> "La Libertad"
+         across(all_of(medidas), ~ .x / divisor)) %>%
+  select(all_of(unidad), RUBRO, all_of(medidas)) %>%
+  pivot_wider(
+    names_from  = RUBRO,
+    values_from = all_of(medidas),
+    names_glue  = "{RUBRO}_{.value}",   # "09_PIA", "09_PIM", ...
+    values_fill = 0
+  )
+
+# Orden de columnas: para cada rubro, PIA | PIM | RECAUDADO
+orden <- as.vector(t(outer(rubros, medidas, paste, sep = "_")))
+tabla_ancha <- tabla_ancha %>% select(all_of(unidad), all_of(orden))
+
+fila_total <- tabla_ancha %>%
+  summarise(across(where(is.numeric), sum)) %>%
+  mutate(!!unidad := "TOTAL")
+
+tabla_final <- bind_rows(tabla_ancha, fila_total)
+```
+
+## Exportar la tabla
+```{r exportar}
+inicio_grupo <- paste0(rubros, "_PIA")   # primera columna de cada rubro
+
+armar_gt <- function(df) {
+  n <- nrow(df)
+
+  gt(df, rowname_col = unidad) %>%
+    tab_stubhead(label = "Departamento") %>%
+
+    # Un spanner por rubro, con PIA | PIM | Recaudado debajo
+    {
+      t <- .
+      for (r in rubros) {
+        t <- tab_spanner(t,
+                         label   = nombres_cortos[[r]],
+                         columns = all_of(paste(r, medidas, sep = "_")),
+                         id      = paste0("sp_", r))
+      }
+      t
+    } %>%
+    cols_label(.list = setNames(
+      as.list(rep(c("PIA", "PIM", "Recaudado"), times = length(rubros))),
+      orden
+    )) %>%
+    fmt_number(columns = everything(), decimals = digitos, sep_mark = ",") %>%
+    cols_align(align = "right", columns = everything()) %>%
+
+    # Encabezado azul con letra blanca
+    tab_style(
+      style = list(cell_fill(color = "#1F3864"),
+                   cell_text(color = "white", weight = "bold")),
+      locations = list(cells_column_labels(), cells_column_spanners(),
+                       cells_stubhead())
+    ) %>%
+
+    # Fila TOTAL en negrita y con fondo
+    tab_style(
+      style = list(cell_text(weight = "bold"), cell_fill(color = "#E7ECF4")),
+      locations = list(cells_body(rows = n), cells_stub(rows = n))
+    ) %>%
+
+    # Separador vertical entre rubros
+    tab_style(
+      style = cell_borders(sides = "left", color = "grey60", weight = px(1.5)),
+      locations = list(cells_body(columns = all_of(inicio_grupo)),
+                       cells_column_labels(columns = all_of(inicio_grupo)))
+    ) %>%
+
+    tab_header(
+      title    = "Ingresos de los Gobiernos Regionales por departamento y rubro",
+      subtitle = paste0("Año ", anio_sel, " (", unidad_txt, ")")
+    ) %>%
+    tab_source_note("Fuente: MEF. Elaboración propia.") %>%
+
+    # Tamaño y espaciado para que quepa en una diapositiva
+    tab_options(
+      table.font.size        = px(11),
+      data_row.padding       = px(3),
+      heading.align          = "left",
+      table.border.top.style = "hidden"
+    )
+}
+
+n_tot <- nrow(tabla_final)
+gt_1 <- armar_gt(slice(tabla_final, 1:13))
+gt_2 <- armar_gt(slice(tabla_final, 14:n_tot))   # incluye TOTAL
+gt_1
+
+gtsave(gt_1, "tabla_1.png", vwidth = 1800, zoom = 2)   # requiere webshot2 y Chrome/Chromium
+gtsave(gt_2, "tabla_2.png", vwidth = 1800, zoom = 2)
+```
+
+## Gráficos
+
+### Barras apiladas por departamento
+```{r grafico-barras}
+g1 <- tabla_mef %>%
+  mutate(
+    depto     = reorder(.data[[unidad]], .data[[medida_graf]], FUN = sum),   # el mayor queda arriba
+    rubro_lab = factor(RUBRO, levels = names(nombres_cortos),
+                       labels = unname(nombres_cortos))
+  ) %>%
+  ggplot(aes(x = .data[[medida_graf]] / divisor, y = depto, fill = rubro_lab)) +
+  geom_col() +
+  scale_x_continuous(labels = label_comma()) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(x = paste0(medida_graf, " (", unidad_txt, ")"), y = NULL, fill = "Rubro",
+       title = paste("Ingresos regionales por departamento y rubro,", anio_sel)) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+g1
+```
+
+### Estructura por rubro (pie)
+```{r grafico-pie}
+g2 <- tabla_mef %>%
+  group_by(RUBRO) %>%
+  summarise(monto = sum(.data[[medida_graf]]) / divisor, .groups = "drop") %>%
+  mutate(
+    rubro_lab = factor(RUBRO, levels = names(nombres_cortos),
+                       labels = unname(nombres_cortos)),
+    pct       = monto / sum(monto),
+    etiqueta  = ifelse(pct < 0.03, "", percent(pct, accuracy = 0.1))   # sin etiqueta bajo 3%
+  ) %>%
+  ggplot(aes(x = "", y = monto, fill = rubro_lab)) +
+  geom_col(width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  geom_text(aes(label = etiqueta), position = position_stack(vjust = 0.5), size = 4) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(fill = "Rubro",
+       title = paste("Estructura de los ingresos regionales,", anio_sel),
+       subtitle = paste(medida_graf, "- total nacional")) +
+  theme_void(base_size = 12)
+g2
+```
+
+### Serie histórica
+```{r grafico-serie}
+# Elige uno (o ambos); el otro déjalo en NULL
+depto_sel <- "AMAZONAS"   # nombre exacto de la base, o NULL
+rubro_sel <- NULL         # código (ej. "15"), o NULL
+stopifnot(!is.null(depto_sel) | !is.null(rubro_sel))
+
+d <- dt_hist
+if (!is.null(depto_sel)) d <- filter(d, .data[[unidad]] == depto_sel)
+if (!is.null(rubro_sel)) d <- filter(d, RUBRO == rubro_sel)
+
+# Departamento elegido: una línea por rubro | rubro elegido: una línea por departamento
+var_color <- if (!is.null(depto_sel)) "rubro_lab" else unidad
+
+titulo <- paste(c(depto_sel,
+                  if (!is.null(rubro_sel)) nombres_cortos[[rubro_sel]]),
+                collapse = " - ")
+
+g3 <- d %>%
+  mutate(rubro_lab = factor(RUBRO, levels = names(nombres_cortos),
+                            labels = unname(nombres_cortos))) %>%
+  group_by(anio, grupo = .data[[var_color]]) %>%
+  summarise(monto = sum(.data[[medida_graf]]) / divisor, .groups = "drop") %>%
+  ggplot(aes(x = anio, y = monto, color = grupo, group = grupo)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = 2012:2025) +
+  scale_y_continuous(labels = label_comma()) +
+  scale_color_brewer(palette = "Set2") +
+  labs(x = NULL, y = paste0(medida_graf, " (", unidad_txt, ")"), color = NULL,
+       title = titulo) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+g3
+```
